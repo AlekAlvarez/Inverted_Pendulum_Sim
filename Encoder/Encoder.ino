@@ -4,7 +4,11 @@
 #include <sys/time.h>
 //uses interrupts
 //S3 only has 2 pcnt modules and can support 2 encoders, but should be enough
-
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/queue.h"
+#include "esp_log.h"
+#include "driver/gpio.h"
 long long currentCLKCount;
 double angle;
 int step; //Channel A
@@ -30,7 +34,7 @@ const double targetAngle = 90; //initial error and target
 const double Kp = 1.0;
 //D = k_d * d(error)/dt
 const double Kd = 1.0;
-
+int steps=0;
 //for angular velocity approximation
 std::vector<double> angles;
 std::vector<long long> times;
@@ -40,6 +44,69 @@ double angular_velocity = 0;
 volatile long long xStep = 0; //mechanical system: changes can randomly happen, volatile flag ensures true value is always known
 long long prev_x;
 int velocity = 0;
+typedef struct {
+    int steps;
+    double error;
+} DataPacket_t;
+// Handle for the Queue used to send the DataPacket_t from Main Thread (Producer) to Consumer Task
+QueueHandle_t calculation_queue = NULL;
+// Handle for the Queue used to send the single integer result BACK from Consumer Task to Main Thread (Producer)
+QueueHandle_t result_queue = NULL;
+void performAcuation(void *pvParameters){
+    double error = 0;
+    int steps = 0;
+    DataPacket_t received_packet;
+
+    // The consumer task runs perpetually
+    while (1) {
+        ESP_LOGI(TAG, "Consumer: Waiting for a new Data Packet (two values) from Producer...");
+
+        // 1. RECEIVE DataPacket_t from Producer
+        if (xQueueReceive(calculation_queue, &received_packet, portMAX_DELAY) == pdPASS) {
+
+            // Reset result calculation for the new cycle
+            error=received_packet.error;
+            xStep+=error;
+            //while the microcontroller is collecting data and pushing an output, it needs to constantly be doing operations while knowing what the values are.
+            //that means that the value of a driver cannot be manually pushed as seen below in a for loop, since the mcu does not know what is going on while it is in the loop
+            //non blocking allows loop code to run continually while still generating pulses
+            //Will be finished by next week!
+            if(error != 0 && (times[1] - times[0] > PULSE_DELAY)) {
+              digitalWrite(pulsePin, HIGH);
+              delayMicroseconds(5);
+              digitalWrite(pulsePin, LOW);
+              //if it goes right
+              if (error > 0) {
+                error--;
+                xStep++;
+              }
+              else {
+                error++;
+                xStep--;
+              }
+            }
+            //rough example
+            for (int i = 0; i < error; i++) {
+              digitalWrite(pulsePin, HIGH);
+              delayMicroSeconds(500); //not feasible since whole code stops until 500 microseconds have passed
+              digitalWrite(pulsePin, LOW);
+              delayMicroseconds(500);
+            }
+
+            // 3. SEND SINGLE INTEGER RESULT BACK to Producer
+            if (xQueueSend(result_queue, &xStep, pdMS_TO_TICKS(100)) != pdPASS) {
+                ESP_LOGE(TAG, "Consumer: Failed to send result back to Producer. Result: %d", calculated_result);
+            } else {
+                ESP_LOGI(TAG, "Consumer: Successfully sent result %d back to Producer.", calculated_result);
+            }
+
+        } else {
+            ESP_LOGE(TAG, "Consumer: Error receiving data from queue.");
+        }
+    }
+}
+
+    
 //may be unecessary
 int64_t get_time() {
     struct timeval tod;
@@ -54,7 +121,33 @@ void removeN(std::vector<int>& angles, std::vector<int>& times, int n){
 }
 
 void setup() {
+  // Queue 1 (Producer -> Consumer): Now holds items of size DataPacket_t.
+    calculation_queue = xQueueCreate(5, sizeof(DataPacket_t));
+    
+    // Queue 2 (Consumer -> Producer): Holds 1 item of size int (only needs to hold one result).
+    result_queue = xQueueCreate(1, sizeof(int));
 
+    if (calculation_queue == NULL || result_queue == NULL) {
+        ESP_LOGE(TAG, "Failed to create one or both FreeRTOS Queues. Cannot proceed.");
+        return;
+    }
+
+    // 2. Create the Consumer Task (the other thread)
+    // Pin it to Core 1 (APP_CPU_NUM)
+    BaseType_t xReturned = xTaskCreatePinnedToCore(
+        consumer_task,      // Function that implements the task
+        "ConsumerTask",     // Text name for the task
+        4096,               // Stack size (in bytes)
+        NULL,               // Parameter passed to the task 
+        5,                  // Priority
+        NULL,               // Task handle
+        APP_CPU_NUM         // Core ID (Core 1)
+    );
+
+    if (xReturned != pdPASS) {
+        ESP_LOGE(TAG, "Failed to create Consumer Task.");
+        return;
+    }
   encoder.clearCount();
 
   //configure pins
@@ -128,41 +221,18 @@ void loop() {
   double stepsToAngle = 4.0;
 
   double driverInput = PD * stepsToAngle; //desired angle change * step per angle
-
-  prev_x = xStep;
-  xStep += error;
-  if (driverInput < 0) {
-    digitalWrite(dirPin, LOW);
-    driverInput = -driverInput;
-  } else {
-    digitalWrite(dirPin, HIGH);
-  }
-
-
-
-  //while the microcontroller is collecting data and pushing an output, it needs to constantly be doing operations while knowing what the values are.
-  //that means that the value of a driver cannot be manually pushed as seen below in a for loop, since the mcu does not know what is going on while it is in the loop
-  //non blocking allows loop code to run continually while still generating pulses
-  //Will be finished by next week!
-  if(error != 0 && (times[1] - times[0] > PULSE_DELAY)) {
-    digitalWrite(pulsePin, HIGH);
-    delayMicroseconds(5);
-    digitalWrite(pulsePin, LOW);
-    //if it goes right
-    if (error > 0) {
-      error--;
-      xStep++;
+    if (driverInput < 0) {
+      digitalWrite(dirPin, LOW);
+      driverInput = -driverInput;
+    } else {
+      digitalWrite(dirPin, HIGH);
     }
-    else {
-      error++;
-      xStep--;
+
+    if (xQueueSend(calculation_queue, &error, pdMS_TO_TICKS(1000)) != pdPASS) {
+            ESP_LOGE(TAG, "Producer: Failed to send data packet to the consumer queue.");
     }
-  }
-  //rough example
-  for (int i = 0; i < error; i++) {
-    digitalWrite(pulsePin, HIGH);
-    delayMicroSeconds(500); //not feasible since whole code stops until 500 microseconds have passed
-    digitalWrite(pulsePin, LOW);
-    delayMicroseconds(500);
-  }
+    if (xQueueReceive(result_queue, &received_result, pdMS_To_TICKS(100)) == pdPASS) {
+                prev_x=xStep;
+                xStep=received_result;
+            }        
 }
