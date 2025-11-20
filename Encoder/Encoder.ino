@@ -88,13 +88,13 @@ void performAcuation(void *pvParameters){
             //rough example
             for (int i = 0; i < error; i++) {
               digitalWrite(pulsePin, HIGH);
-              delayMicroSeconds(500); //not feasible since whole code stops until 500 microseconds have passed
+              delayMicroseconds(500); //not feasible since whole code stops until 500 microseconds have passed
               digitalWrite(pulsePin, LOW);
               delayMicroseconds(500);
             }
 
             // 3. SEND SINGLE INTEGER RESULT BACK to Producer
-            if (xQueueSend(result_queue, &xStep, pdMS_TO_TICKS(100)) != pdPASS) {
+            if (xQueueSend(result_queue,(void*) &xStep, pdMS_TO_TICKS(100)) != pdPASS) {
                 ESP_LOGE(TAG, "Consumer: Failed to send result back to Producer. Result: %d", calculated_result);
             } else {
                 ESP_LOGI(TAG, "Consumer: Successfully sent result %d back to Producer.", calculated_result);
@@ -135,8 +135,8 @@ void setup() {
     // 2. Create the Consumer Task (the other thread)
     // Pin it to Core 1 (APP_CPU_NUM)
     BaseType_t xReturned = xTaskCreatePinnedToCore(
-        consumer_task,      // Function that implements the task
-        "ConsumerTask",     // Text name for the task
+        performAcuation,      // Function that implements the task
+        "performAcuation",     // Text name for the task
         4096,               // Stack size (in bytes)
         NULL,               // Parameter passed to the task 
         5,                  // Priority
@@ -194,7 +194,8 @@ void loop() {
   //for x position and x', refer to time
   if (times.size() >= 2) {
     velocity = (xStep - prev_x)/(times[times.size() - 1] - times[times.size() - 2]); //steps/ms
-    dError = (error)
+    dError = prevError;
+    //TODO Change this to properly calculatte dError
   }
   //angular velocity calculated by luke: vector in C++; check github
   /*For the control/math itself*/
@@ -211,7 +212,7 @@ void loop() {
   //if error is less than 0, then angle is to the right of 90 degrees
   //right now, error is in angles, need to consider angular velocity, cart velocity, position, and angle (controls)
   //track is only 0.5m long, so there has to be a limit on speed, current value is arbitrary
-  const double maxSpeed = 500.0
+  const double maxSpeed = 500.0;
 
   //no integral term
   double PD = -(Kp * error + Kd * dError); //output from controller in terms of degrees
@@ -231,8 +232,7 @@ void loop() {
     if (xQueueSend(calculation_queue, &error, pdMS_TO_TICKS(1000)) != pdPASS) {
             ESP_LOGE(TAG, "Producer: Failed to send data packet to the consumer queue.");
     }
-    if (xQueueReceive(result_queue, &received_result, pdMS_To_TICKS(100)) == pdPASS) {
+    if (xQueueReceive(result_queue,(void*) &xStep, pdMS_TO_TICKS(100)) == pdPASS) {
                 prev_x=xStep;
-                xStep=received_result;
             }        
 }
